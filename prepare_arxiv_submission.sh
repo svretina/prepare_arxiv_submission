@@ -119,6 +119,54 @@ rewrite_flattened_asset_paths() {
   ' "$tex_file"
 }
 
+prune_unused_figures() {
+  local submission_dir="$1"
+  local tex_file="$2"
+  local figure
+  local stem
+  local ext
+  local ref
+  local used=false
+  local -a used_refs=()
+
+  mapfile -t used_refs < <(
+    perl -ne '
+      while (/\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^}]+)\}/g) {
+        print "$1\n";
+      }
+    ' "$tex_file" | sort -u
+  )
+
+  while IFS= read -r -d '' figure; do
+    stem="$(basename "$figure")"
+    ext="${stem##*.}"
+    stem="${stem%.*}"
+    used=false
+
+    for ref in "${used_refs[@]}"; do
+      ref="${ref#./}"
+      if [[ "$ref" == "$stem" || "$ref" == "$stem.$ext" ]]; then
+        used=true
+        break
+      fi
+    done
+
+    if [[ "$used" == false ]]; then
+      rm -f "$figure"
+    fi
+  done < <(
+    find "$submission_dir" -maxdepth 1 -type f \( \
+      -iname '*.pdf' -o \
+      -iname '*.png' -o \
+      -iname '*.jpg' -o \
+      -iname '*.jpeg' -o \
+      -iname '*.eps' -o \
+      -iname '*.ps' -o \
+      -iname '*.svg' \
+    \) ! -name "${MAIN_TEX%.tex}.pdf" -print0
+  )
+}
+
 command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -228,12 +276,15 @@ flatten_asset_dir_to_root "$SUBMISSION_DIR" plots
 rewrite_flattened_asset_paths "$SUBMISSION_DIR/$MAIN_TEX"
 
 echo "5. Removing comments and adding arXiv multi-pass trigger ..."
-perl -pi -e 's/(?<!\\)%.*$//' "$SUBMISSION_DIR/$MAIN_TEX"
+perl -0pi -e 's/^[ \t]*%[^\n]*\n//mg; s/(?<!\\)%[^\n]*//g' "$SUBMISSION_DIR/$MAIN_TEX"
 if ! grep -Fq 'get arXiv to do 4 passes' "$SUBMISSION_DIR/$MAIN_TEX"; then
   printf '\n\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n' >> "$SUBMISSION_DIR/$MAIN_TEX"
 fi
 
-echo "6. Compiling submission copy ..."
+echo "6. Removing unused flattened figure files ..."
+prune_unused_figures "$SUBMISSION_DIR" "$SUBMISSION_DIR/$MAIN_TEX"
+
+echo "7. Compiling submission copy ..."
 (
   cd "$SUBMISSION_DIR"
 
@@ -262,7 +313,7 @@ if [[ -n "$BIB_FILE" ]]; then
   fi
 fi
 
-echo "7. Cleaning generated files, keeping .bbl ..."
+echo "8. Cleaning generated files, keeping .bbl ..."
 find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
   -name '*.aux' -o \
   -name '*.log' -o \
@@ -283,15 +334,13 @@ find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
 
 rm -f "$SUBMISSION_DIR/$jobname.pdf"
 
-if [[ -n "$BIB_FILE" ]]; then
-  rm -f "$SUBMISSION_DIR/$(basename "$BIB_FILE")"
-fi
+find "$SUBMISSION_DIR" -maxdepth 1 -type f -name '*.bib' -delete
 
-echo "8. Final submission contents:"
+echo "9. Final submission contents:"
 find "$SUBMISSION_DIR" -mindepth 1 | sed "s#^$SOURCE_DIR/##" | sort
 
 echo
-echo "9. Creating tarball: $TAR_PATH"
+echo "10. Creating tarball: $TAR_PATH"
 (
   cd "$SUBMISSION_DIR"
   rm -f "$(basename "$TAR_PATH")"

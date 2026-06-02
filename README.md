@@ -47,6 +47,7 @@ If a single `.tex` argument is provided, the script uses that file as the main d
 - It copies `figures/` and `plots/` if they exist.
 - It flattens copied `figures/` and `plots/` into the submission root.
 - It rewrites copied `\includegraphics{...}` paths to match the flattened filenames.
+- It scans the copied main `.tex` and deletes flattened figure files that are not referenced by `\includegraphics`.
 - It removes comments from the copied main `.tex`.
 - It adds the arXiv multi-pass trigger line if missing.
 - It compiles the copied submission tree.
