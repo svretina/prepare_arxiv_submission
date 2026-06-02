@@ -1,8 +1,4 @@
-Implements the guidelines of
-<https://trevorcampbell.me/html/arxiv.html>
-for preparing an arXiv submission.
-
-# Prepare a LaTeX paper source tree for arXiv submission
+# Prepare an arXiv submission tree through Trevor Campbell step 11
 
 # Usage
 
@@ -38,13 +34,20 @@ If a single `.tex` argument is provided, the script uses that file as the main d
 
 # Output
 
-   SOURCE_DIR/arxiv_submission/
-   SOURCE_DIR/ax.tar
+`SOURCE_DIR/arxiv_submission/`
+
+`SOURCE_DIR/arxiv_submission/ax.tar`
 
 # Notes
 
-- This script edits only the copied `arxiv_submission/` directory.
-- It flattens subdirectories into the submission root.
-- It rewrites common LaTeX references so files are addressed from the root.
-- It removes comments from `.tex` files.
-- It compiles the document, keeps the generated `.bbl`, removes `.bib` and build files, then creates `ax.tar`.
+- This script only copies a small set of inputs into `arxiv_submission/`.
+- It copies the chosen main `.tex` file.
+- It copies one `.bib` file if found:
+  same basename as the main `.tex` is preferred, then common names such as `bibliography.bib` or `references.bib`.
+- It copies `figures/` and `plots/` if they exist.
+- It flattens copied `figures/` and `plots/` into the submission root.
+- It rewrites copied `\includegraphics{...}` paths to match the flattened filenames.
+- It removes comments from the copied main `.tex`.
+- It adds the arXiv multi-pass trigger line if missing.
+- It compiles the copied submission tree.
+- It keeps the generated `.bbl`, removes the copied `.bib`, removes build products, and creates `ax.tar` inside `arxiv_submission/`.

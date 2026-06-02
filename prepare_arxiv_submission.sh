@@ -1,34 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# prepare_arxiv_submission.sh
-#
-# Prepare a LaTeX paper source tree for arXiv submission.
-#
-# Usage:
-#   ./prepare_arxiv_submission.sh
-#   ./prepare_arxiv_submission.sh [SOURCE_DIR]
-#   ./prepare_arxiv_submission.sh [MAIN_TEX]
-#   ./prepare_arxiv_submission.sh [SOURCE_DIR] [MAIN_TEX]
-#
-# Examples:
-#   ./prepare_arxiv_submission.sh
-#   ./prepare_arxiv_submission.sh paper.tex
-#   ./prepare_arxiv_submission.sh . main.tex
-#   ./prepare_arxiv_submission.sh /path/to/paper paper.tex
-#
-# Output:
-#   SOURCE_DIR/arxiv_submission/
-#   SOURCE_DIR/ax.tar
-#
-# Notes:
-#   - This script edits only the copied arxiv_submission/ directory.
-#   - It flattens subdirectories into the submission root.
-#   - It rewrites common LaTeX references so files are addressed from the root.
-#   - It removes comments from .tex files.
-#   - It compiles the document, keeps the generated .bbl, removes .bib and build files,
-#     then creates ax.tar.
-
 usage() {
   echo "Usage: $0 [SOURCE_DIR] [MAIN_TEX]" >&2
   echo "   or: $0 [MAIN_TEX]" >&2
@@ -47,6 +19,115 @@ discover_main_tex() {
 
   echo "Error: no main TeX file provided and none of article.tex, paper.tex, or main.tex were found in $dir" >&2
   return 1
+}
+
+find_bib_file() {
+  local dir="$1"
+  local main_tex="$2"
+  local main_base="${main_tex%.tex}"
+  local candidate
+  local -a preferred=(
+    "$main_base.bib"
+    bibliography.bib
+    references.bib
+    refs.bib
+    ref.bib
+    bib.bib
+  )
+
+  for candidate in "${preferred[@]}"; do
+    if [[ -f "$dir/$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  mapfile -t bib_files < <(find "$dir" -maxdepth 1 -type f -name '*.bib' -printf '%f\n' | sort)
+  if [[ "${#bib_files[@]}" -eq 1 ]]; then
+    printf '%s\n' "${bib_files[0]}"
+    return 0
+  fi
+
+  return 1
+}
+
+copy_asset_dir() {
+  local source_dir="$1"
+  local submission_dir="$2"
+  local candidate
+  local copied=false
+
+  for candidate in figures plots; do
+    if [[ -d "$source_dir/$candidate" ]]; then
+      cp -a "$source_dir/$candidate" "$submission_dir/"
+      copied=true
+    fi
+  done
+
+  if [[ "$copied" == false ]]; then
+    echo "Warning: no figures/ or plots/ directory found in $source_dir" >&2
+  fi
+}
+
+flatten_asset_dir_to_root() {
+  local submission_dir="$1"
+  local asset_dir_name="$2"
+  local asset_dir="$submission_dir/$asset_dir_name"
+  local duplicates=""
+  local file
+  local base
+
+  [[ -d "$asset_dir" ]] || return 0
+
+  duplicates="$(
+    find "$asset_dir" -mindepth 2 -type f -printf '%f\n' | sort | uniq -d || true
+  )"
+
+  if [[ -n "$duplicates" ]]; then
+    echo "Error: duplicate filenames found under $asset_dir; cannot flatten safely." >&2
+    echo "$duplicates" | sed 's/^/  - /' >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d '' file; do
+    base="$(basename "$file")"
+    if [[ -e "$submission_dir/$base" && "$submission_dir/$base" != "$file" ]]; then
+      echo "Error: flattening $asset_dir_name/ would overwrite existing file $base in submission root." >&2
+      exit 1
+    fi
+    mv "$file" "$submission_dir/$base"
+  done < <(find "$asset_dir" -mindepth 2 -type f -print0)
+
+  while IFS= read -r -d '' file; do
+    base="$(basename "$file")"
+    if [[ -e "$submission_dir/$base" && "$submission_dir/$base" != "$file" ]]; then
+      echo "Error: flattening $asset_dir_name/ would overwrite existing file $base in submission root." >&2
+      exit 1
+    fi
+    mv "$file" "$submission_dir/$base"
+  done < <(find "$asset_dir" -maxdepth 1 -type f -print0)
+
+  rm -rf "$asset_dir"
+}
+
+rewrite_flattened_asset_paths() {
+  local tex_file="$1"
+
+  perl -0pi -e '
+    s{(\\includegraphics(?:\s*\[[^\]]*\])?\s*\{)(figures|plots)/(?:[^{}\/]+/)*([^{}\/]+\})}{$1$3}g;
+    s{\\graphicspath\s*\{(?:\{[^{}]*\})+\}}{}g;
+  ' "$tex_file"
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+  if ! command_exists "$1"; then
+    echo "Error: required command not found: $1" >&2
+    exit 1
+  fi
 }
 
 case "$#" in
@@ -101,21 +182,16 @@ if [[ ! -f "$SOURCE_DIR/$MAIN_TEX" ]]; then
   exit 1
 fi
 
+BIB_FILE=""
+if BIB_FILE="$(find_bib_file "$SOURCE_DIR" "$MAIN_TEX")"; then
+  :
+else
+  echo "Warning: no suitable .bib file found next to $MAIN_TEX" >&2
+fi
+
 SUBMISSION_DIR="$SOURCE_DIR/arxiv_submission"
-TAR_PATH="$SOURCE_DIR/ax.tar"
+TAR_PATH="$SUBMISSION_DIR/ax.tar"
 
-command_exists() {
-  command -v "$1" >/dev/null 2>&1
-}
-
-require_command() {
-  if ! command_exists "$1"; then
-    echo "Error: required command not found: $1" >&2
-    exit 1
-  fi
-}
-
-require_command rsync
 require_command perl
 require_command find
 require_command tar
@@ -123,180 +199,71 @@ require_command tar
 echo "Preparing arXiv submission from:"
 echo "  source: $SOURCE_DIR"
 echo "  main:   $MAIN_TEX"
+if [[ -n "$BIB_FILE" ]]; then
+  echo "  bib:    $BIB_FILE"
+else
+  echo "  bib:    none found"
+fi
 echo
 
 rm -rf "$SUBMISSION_DIR"
-rm -f "$TAR_PATH"
 mkdir -p "$SUBMISSION_DIR"
 
-echo "1. Copying source tree to arxiv_submission/ ..."
-rsync -a \
-  --exclude='arxiv_submission/' \
-  --exclude='.git/' \
-  --exclude='.svn/' \
-  --exclude='.hg/' \
-  --exclude='.DS_Store' \
-  --exclude='__MACOSX/' \
-  --exclude='ax.tar' \
-  "$SOURCE_DIR/" "$SUBMISSION_DIR/"
+echo "1. Copying main TeX file ..."
+cp -a "$SOURCE_DIR/$MAIN_TEX" "$SUBMISSION_DIR/"
 
-cd "$SUBMISSION_DIR"
-
-echo "2. Removing hidden files/directories and common private/editor artifacts ..."
-find . -mindepth 1 -name '.*' -exec rm -rf {} + 2>/dev/null || true
-find . -type f \( \
-  -name '*~' -o \
-  -name '*.bak' -o \
-  -name '*.tmp' -o \
-  -name '*.swp' -o \
-  -name '*.swo' -o \
-  -name '.#*' \
-\) -delete
-
-echo "3. Removing existing build artifacts and rendered PDFs ..."
-find . -type f \( \
-  -name '*.aux' -o \
-  -name '*.log' -o \
-  -name '*.out' -o \
-  -name '*.toc' -o \
-  -name '*.lof' -o \
-  -name '*.lot' -o \
-  -name '*.fls' -o \
-  -name '*.fdb_latexmk' -o \
-  -name '*.synctex.gz' -o \
-  -name '*.blg' -o \
-  -name '*.run.xml' -o \
-  -name '*.bcf' -o \
-  -name '*.nav' -o \
-  -name '*.snm' -o \
-  -name '*.vrb' -o \
-  -name '*.pdf' \
-\) -delete
-
-# File types commonly needed for LaTeX/arXiv submissions.
-# Everything else is considered non-source/non-asset and is removed before flattening.
-echo "4. Removing files that are usually not needed for arXiv compilation ..."
-find . -type f ! \( \
-  -name '*.tex' -o \
-  -name '*.sty' -o \
-  -name '*.cls' -o \
-  -name '*.bst' -o \
-  -name '*.bib' -o \
-  -name '*.bbl' -o \
-  -name '*.bbx' -o \
-  -name '*.cbx' -o \
-  -name '*.cfg' -o \
-  -name '*.def' -o \
-  -name '*.clo' -o \
-  -name '*.ldf' -o \
-  -name '*.ist' -o \
-  -name '*.eps' -o \
-  -name '*.ps' -o \
-  -name '*.pdf_tex' -o \
-  -name '*.png' -o \
-  -name '*.jpg' -o \
-  -name '*.jpeg' -o \
-  -name '*.pdf' -o \
-  -name '*.svg' \
-\) -delete
-
-echo "5. Flattening subdirectories into arxiv_submission/ root ..."
-
-# Detect duplicate basenames before flattening. arXiv wants a simple structure,
-# but duplicate filenames cannot be flattened safely without semantic choices.
-duplicates="$(
-  find . -mindepth 2 -type f -printf '%f\n' | sort | uniq -d || true
-)"
-
-if [[ -n "$duplicates" ]]; then
-  echo "Error: duplicate filenames found in subdirectories; cannot flatten safely." >&2
-  echo "$duplicates" | sed 's/^/  - /' >&2
-  echo >&2
-  echo "Rename these files in the source tree or handle them manually, then rerun." >&2
-  exit 1
-fi
-
-# Move every file from subdirectories to the root.
-while IFS= read -r -d '' file; do
-  base="$(basename "$file")"
-  mv "$file" "./$base"
-done < <(find . -mindepth 2 -type f -print0)
-
-# Remove now-empty directories.
-find . -mindepth 1 -type d -empty -delete
-
-echo "6. Rewriting common LaTeX paths to flattened basenames ..."
-
-# This covers common LaTeX commands whose arguments point to files.
-# Examples:
-#   \input{sections/intro}         -> \input{intro}
-#   \includegraphics[...]{figs/a}  -> \includegraphics[...]{a}
-#   \bibliography{bib/references}  -> \bibliography{references}
-#
-# It intentionally does not rewrite arbitrary text.
-shopt -s nullglob
-for f in *.tex *.sty *.cls; do
-  [[ -f "$f" ]] || continue
-  perl -0pi -e '
-    s{\\(input|include|subfile|bibliography|addbibresource|includegraphics)(\s*(?:\[[^\]]*\]\s*)?\{)([^{}]*\/)([^{}\/]+)(\})}{\\$1$2$4$5}g;
-    s{\\graphicspath\s*\{(?:\{[^{}]*\})+\}}{}g;
-  ' "$f"
-done
-
-echo "7. Removing LaTeX comments from .tex files ..."
-
-# Remove comments that start with an unescaped percent sign.
-# This is a pragmatic LaTeX comment stripper. It preserves escaped \%.
-# Caveat: as with most simple strippers, unusual verbatim/minted/comment-heavy
-# constructs should be inspected manually afterwards.
-for f in *.tex; do
-  [[ -f "$f" ]] || continue
-  perl -pi -e 's/(?<!\\)%.*$//' "$f"
-done
-shopt -u nullglob
-
-echo "8. Adding arXiv multi-pass trigger after \\end{document}, if missing ..."
-if ! grep -Fq 'get arXiv to do 4 passes' "$MAIN_TEX"; then
-  printf '\n\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n' >> "$MAIN_TEX"
-fi
-
-echo "9. Compiling to generate/check PDF and .bbl ..."
-
-compile_with_latexmk=false
-if command_exists latexmk; then
-  compile_with_latexmk=true
-fi
-
-if "$compile_with_latexmk"; then
-  latexmk -pdf -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+if [[ -n "$BIB_FILE" ]]; then
+  echo "2. Copying BibTeX file ..."
+  cp -a "$SOURCE_DIR/$BIB_FILE" "$SUBMISSION_DIR/"
 else
-  require_command pdflatex
-  pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
-
-  # Try common bibliography workflows.
-  jobname="${MAIN_TEX%.tex}"
-  if [[ -f "$jobname.aux" ]]; then
-    if grep -q '\\bibdata{' "$jobname.aux" && command_exists bibtex; then
-      bibtex "$jobname" || true
-    fi
-  fi
-
-  pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
-  pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
-  pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+  echo "2. Skipping BibTeX copy ..."
 fi
+
+echo "3. Copying figures/plots directories if present ..."
+copy_asset_dir "$SOURCE_DIR" "$SUBMISSION_DIR"
+
+echo "4. Flattening copied figures/plots into submission root ..."
+flatten_asset_dir_to_root "$SUBMISSION_DIR" figures
+flatten_asset_dir_to_root "$SUBMISSION_DIR" plots
+rewrite_flattened_asset_paths "$SUBMISSION_DIR/$MAIN_TEX"
+
+echo "5. Removing comments and adding arXiv multi-pass trigger ..."
+perl -pi -e 's/(?<!\\)%.*$//' "$SUBMISSION_DIR/$MAIN_TEX"
+if ! grep -Fq 'get arXiv to do 4 passes' "$SUBMISSION_DIR/$MAIN_TEX"; then
+  printf '\n\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n' >> "$SUBMISSION_DIR/$MAIN_TEX"
+fi
+
+echo "6. Compiling submission copy ..."
+(
+  cd "$SUBMISSION_DIR"
+
+  if command_exists latexmk; then
+    latexmk -pdf -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+  else
+    require_command pdflatex
+    pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+
+    jobname="${MAIN_TEX%.tex}"
+    if [[ -n "$BIB_FILE" && -f "$jobname.aux" ]] && grep -q '\\bibdata{' "$jobname.aux"; then
+      require_command bibtex
+      bibtex "$jobname"
+    fi
+
+    pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+    pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+    pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
+  fi
+)
 
 jobname="${MAIN_TEX%.tex}"
-
-if [[ ! -f "$jobname.bbl" ]]; then
-  echo "Warning: no .bbl file was produced." >&2
-  echo "If your paper uses BibTeX, inspect the compile log before submitting." >&2
+if [[ -n "$BIB_FILE" ]]; then
+  if [[ ! -f "$SUBMISSION_DIR/$jobname.bbl" ]]; then
+    echo "Warning: no .bbl file was generated." >&2
+  fi
 fi
 
-echo "10. Removing .bib and post-compile generated files, keeping .bbl ..."
-find . -type f -name '*.bib' -delete
-
-find . -type f \( \
+echo "7. Cleaning generated files, keeping .bbl ..."
+find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
   -name '*.aux' -o \
   -name '*.log' -o \
   -name '*.out' -o \
@@ -311,16 +278,25 @@ find . -type f \( \
   -name '*.bcf' -o \
   -name '*.nav' -o \
   -name '*.snm' -o \
-  -name '*.vrb' -o \
-  -name '*.pdf' \
+  -name '*.vrb' \
 \) -delete
 
-echo "11. Final public-file sanity listing:"
-find . -maxdepth 1 -type f | sed 's#^\./##' | sort
+rm -f "$SUBMISSION_DIR/$jobname.pdf"
+
+if [[ -n "$BIB_FILE" ]]; then
+  rm -f "$SUBMISSION_DIR/$(basename "$BIB_FILE")"
+fi
+
+echo "8. Final submission contents:"
+find "$SUBMISSION_DIR" -mindepth 1 | sed "s#^$SOURCE_DIR/##" | sort
 
 echo
-echo "12. Creating tarball: $TAR_PATH"
-tar -cvvf "$TAR_PATH" ./* >/dev/null
+echo "9. Creating tarball: $TAR_PATH"
+(
+  cd "$SUBMISSION_DIR"
+  rm -f "$(basename "$TAR_PATH")"
+  tar -cvvf "$TAR_PATH" --exclude="$(basename "$TAR_PATH")" * >/dev/null
+)
 
 echo
 echo "Done."
@@ -328,5 +304,3 @@ echo "Prepared source directory:"
 echo "  $SUBMISSION_DIR"
 echo "Tarball to upload:"
 echo "  $TAR_PATH"
-echo
-echo "Important: inspect arxiv_submission/ before uploading. Everything in ax.tar will be public."
