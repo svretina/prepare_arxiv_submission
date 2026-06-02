@@ -6,9 +6,14 @@ set -euo pipefail
 # Prepare a LaTeX paper source tree for arXiv submission.
 #
 # Usage:
+#   ./prepare_arxiv_submission.sh
+#   ./prepare_arxiv_submission.sh [SOURCE_DIR]
+#   ./prepare_arxiv_submission.sh [MAIN_TEX]
 #   ./prepare_arxiv_submission.sh [SOURCE_DIR] [MAIN_TEX]
 #
 # Examples:
+#   ./prepare_arxiv_submission.sh
+#   ./prepare_arxiv_submission.sh paper.tex
 #   ./prepare_arxiv_submission.sh . main.tex
 #   ./prepare_arxiv_submission.sh /path/to/paper paper.tex
 #
@@ -24,23 +29,80 @@ set -euo pipefail
 #   - It compiles the document, keeps the generated .bbl, removes .bib and build files,
 #     then creates ax.tar.
 
-SOURCE_DIR="${1:-.}"
-MAIN_TEX="${2:-main.tex}"
+usage() {
+  echo "Usage: $0 [SOURCE_DIR] [MAIN_TEX]" >&2
+  echo "   or: $0 [MAIN_TEX]" >&2
+}
 
-SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
-SUBMISSION_DIR="$SOURCE_DIR/arxiv_submission"
-TAR_PATH="$SOURCE_DIR/ax.tar"
+discover_main_tex() {
+  local dir="$1"
+  local candidate
+
+  for candidate in article.tex paper.tex main.tex; do
+    if [[ -f "$dir/$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "Error: no main TeX file provided and none of article.tex, paper.tex, or main.tex were found in $dir" >&2
+  return 1
+}
+
+case "$#" in
+  0)
+    SOURCE_DIR="$PWD"
+    MAIN_TEX=""
+    ;;
+  1)
+    if [[ -d "$1" ]]; then
+      SOURCE_DIR="$1"
+      MAIN_TEX=""
+    else
+      if [[ "$1" != *.tex ]]; then
+        echo "Error: single argument must be an existing directory or a .tex file." >&2
+        usage
+        exit 1
+      fi
+
+      if [[ "$1" == */* ]]; then
+        SOURCE_DIR="${1%/*}"
+        MAIN_TEX="${1##*/}"
+      else
+        SOURCE_DIR="$PWD"
+        MAIN_TEX="$1"
+      fi
+    fi
+    ;;
+  2)
+    SOURCE_DIR="$1"
+    MAIN_TEX="$2"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
 
 if [[ ! -d "$SOURCE_DIR" ]]; then
   echo "Error: source directory does not exist: $SOURCE_DIR" >&2
   exit 1
 fi
 
+SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
+
+if [[ -z "${MAIN_TEX:-}" ]]; then
+  MAIN_TEX="$(discover_main_tex "$SOURCE_DIR")"
+fi
+
 if [[ ! -f "$SOURCE_DIR/$MAIN_TEX" ]]; then
   echo "Error: main TeX file not found: $SOURCE_DIR/$MAIN_TEX" >&2
-  echo "Usage: $0 [SOURCE_DIR] [MAIN_TEX]" >&2
+  usage
   exit 1
 fi
+
+SUBMISSION_DIR="$SOURCE_DIR/arxiv_submission"
+TAR_PATH="$SOURCE_DIR/ax.tar"
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
@@ -172,7 +234,8 @@ echo "6. Rewriting common LaTeX paths to flattened basenames ..."
 #   \bibliography{bib/references}  -> \bibliography{references}
 #
 # It intentionally does not rewrite arbitrary text.
-for f in *.tex *.sty *.cls 2>/dev/null; do
+shopt -s nullglob
+for f in *.tex *.sty *.cls; do
   [[ -f "$f" ]] || continue
   perl -0pi -e '
     s{\\(input|include|subfile|bibliography|addbibresource|includegraphics)(\s*(?:\[[^\]]*\]\s*)?\{)([^{}]*\/)([^{}\/]+)(\})}{\\$1$2$4$5}g;
@@ -186,10 +249,11 @@ echo "7. Removing LaTeX comments from .tex files ..."
 # This is a pragmatic LaTeX comment stripper. It preserves escaped \%.
 # Caveat: as with most simple strippers, unusual verbatim/minted/comment-heavy
 # constructs should be inspected manually afterwards.
-for f in *.tex 2>/dev/null; do
+for f in *.tex; do
   [[ -f "$f" ]] || continue
   perl -pi -e 's/(?<!\\)%.*$//' "$f"
 done
+shopt -u nullglob
 
 echo "8. Adding arXiv multi-pass trigger after \\end{document}, if missing ..."
 if ! grep -Fq 'get arXiv to do 4 passes' "$MAIN_TEX"; then
