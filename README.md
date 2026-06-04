@@ -1,6 +1,8 @@
 # Prepare an arXiv submission
 
-`prepare_arxiv_submission.sh` prepares a reduced arXiv upload tree from a LaTeX project, following the Trevor Campbell workflow through the compile-and-package stage while starting from a restricted set of inputs.
+`prepare_arxiv_submission.sh` prepares a reduced arXiv upload tree from a LaTeX project, following the Trevor Campbell workflow [1] through the compile-and-package stage while starting from a restricted set of inputs.
+
+[1] <https://trevorcampbell.me/html/arxiv.html>
 
 ## Usage
 
