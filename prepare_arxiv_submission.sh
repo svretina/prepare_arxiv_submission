@@ -119,6 +119,24 @@ rewrite_flattened_asset_paths() {
   ' "$tex_file"
 }
 
+preprocess_main_tex() {
+  local tex_file="$1"
+
+  perl -0pi -e '
+    s/^[ \t]*%[^\n]*\n//mg;
+    s/(?<!\\)%[^\n]*//g;
+
+    1 while s{
+      \\iffalse\b
+      (?:
+        (?!\\iffalse\b|\\fi\b).
+        | (?0)
+      )*
+      \\fi\b
+    }{}gsx;
+  ' "$tex_file"
+}
+
 prune_unused_figures() {
   local submission_dir="$1"
   local tex_file="$2"
@@ -275,8 +293,8 @@ flatten_asset_dir_to_root "$SUBMISSION_DIR" figures
 flatten_asset_dir_to_root "$SUBMISSION_DIR" plots
 rewrite_flattened_asset_paths "$SUBMISSION_DIR/$MAIN_TEX"
 
-echo "5. Removing comments and adding arXiv multi-pass trigger ..."
-perl -0pi -e 's/^[ \t]*%[^\n]*\n//mg; s/(?<!\\)%[^\n]*//g' "$SUBMISSION_DIR/$MAIN_TEX"
+echo "5. Removing comments, stripping \iffalse blocks, and adding arXiv multi-pass trigger ..."
+preprocess_main_tex "$SUBMISSION_DIR/$MAIN_TEX"
 if ! grep -Fq 'get arXiv to do 4 passes' "$SUBMISSION_DIR/$MAIN_TEX"; then
   printf '\n\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n' >> "$SUBMISSION_DIR/$MAIN_TEX"
 fi

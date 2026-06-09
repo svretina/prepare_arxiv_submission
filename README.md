@@ -61,7 +61,7 @@ After copying, the script modifies only the submission copy.
 
 1. It flattens files from `figures/` and `plots/` into the submission root.
 2. It rewrites `\includegraphics{...}` paths in the copied main `.tex` to match the flattened filenames.
-3. It removes LaTeX comments from the copied main `.tex`.
+3. It removes LaTeX comments and strips `\iffalse...\fi` blocks from the copied main `.tex`.
 4. It appends the standard arXiv rerun trigger line if it is missing.
 5. It scans the copied main `.tex` for `\includegraphics` usage and deletes flattened figure files that are not referenced.
 6. It compiles the copied submission tree with `latexmk` if available, otherwise with `pdflatex` and `bibtex`.
