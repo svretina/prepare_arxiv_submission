@@ -102,72 +102,156 @@ print "$_\n" for @bib_files;
 PERL
 }
 
-copy_asset_dir() {
+copy_referenced_figures() {
   local source_dir="$1"
-  local submission_dir="$2"
-  local candidate
-  local copied=false
+  local source_tex="$2"
+  local submission_dir="$3"
+  local submission_tex="$4"
 
-  for candidate in figures plots; do
-    if [[ -d "$source_dir/$candidate" ]]; then
-      cp -a "$source_dir/$candidate" "$submission_dir/"
-      copied=true
-    fi
-  done
+  perl - "$source_dir" "$source_tex" "$submission_dir" "$submission_tex" <<'PERL'
+use strict;
+use warnings;
+use File::Basename qw(basename dirname);
+use File::Copy qw(copy);
 
-  if [[ "$copied" == false ]]; then
-    echo "Warning: no figures/ or plots/ directory found in $source_dir" >&2
-  fi
+my ($source_dir, $source_tex, $submission_dir, $submission_tex) = @ARGV;
+open my $source_fh, '<', $source_tex or die "Error: cannot read $source_tex: $!\n";
+local $/;
+my $tex = <$source_fh>;
+close $source_fh or die "Error: cannot close $source_tex: $!\n";
+
+# Ignore references that LaTeX will ignore.
+$tex =~ s/^[ \t]*%[^\n]*\n//mg;
+$tex =~ s/(?<!\\)%[^\n]*//g;
+1 while $tex =~ s{
+  \\iffalse\b
+  (?:
+    (?!\\iffalse\b|\\fi\b).
+    | (?0)
+  )*
+  \\fi\b
+}{}gsx;
+
+my @search_paths = ('.');
+while ($tex =~ m!\\graphicspath\s*\{((?:\{[^{}]*\})+)\}!g) {
+  my $paths = $1;
+  while ($paths =~ /\{([^{}]*)\}/g) {
+    my $path = $1;
+    $path =~ s/^\s+|\s+$//g;
+    $path =~ s{/$}{};
+    push @search_paths, $path if length $path;
+  }
 }
 
-flatten_asset_dir_to_root() {
-  local submission_dir="$1"
-  local asset_dir_name="$2"
-  local asset_dir="$submission_dir/$asset_dir_name"
-  local duplicates=""
-  local file
-  local base
-
-  [[ -d "$asset_dir" ]] || return 0
-
-  duplicates="$(
-    find "$asset_dir" -mindepth 2 -type f -printf '%f\n' | sort | uniq -d || true
-  )"
-
-  if [[ -n "$duplicates" ]]; then
-    echo "Error: duplicate filenames found under $asset_dir; cannot flatten safely." >&2
-    echo "$duplicates" | sed 's/^/  - /' >&2
-    exit 1
-  fi
-
-  while IFS= read -r -d '' file; do
-    base="$(basename "$file")"
-    if [[ -e "$submission_dir/$base" && "$submission_dir/$base" != "$file" ]]; then
-      echo "Error: flattening $asset_dir_name/ would overwrite existing file $base in submission root." >&2
-      exit 1
-    fi
-    mv "$file" "$submission_dir/$base"
-  done < <(find "$asset_dir" -mindepth 2 -type f -print0)
-
-  while IFS= read -r -d '' file; do
-    base="$(basename "$file")"
-    if [[ -e "$submission_dir/$base" && "$submission_dir/$base" != "$file" ]]; then
-      echo "Error: flattening $asset_dir_name/ would overwrite existing file $base in submission root." >&2
-      exit 1
-    fi
-    mv "$file" "$submission_dir/$base"
-  done < <(find "$asset_dir" -maxdepth 1 -type f -print0)
-
-  rm -rf "$asset_dir"
+sub is_safe_relative_path {
+  my ($path) = @_;
+  return $path !~ m!\A/|(?:\A|/)\.\.(?:/|\z)!;
 }
 
-rewrite_flattened_asset_paths() {
-  local tex_file="$1"
+sub graphics_file {
+  my ($relative_path) = @_;
+  return undef unless is_safe_relative_path($relative_path);
+  return undef unless -f "$source_dir/$relative_path";
+  return undef unless $relative_path =~ /\.(?:pdf|png|jpe?g|eps|ps|svg)\z/i;
+  return $relative_path;
+}
 
-  perl -0pi -e '
-    s{(\\includegraphics(?:\s*\[[^\]]*\])?\s*\{)(figures|plots)/(?:[^{}\/]+/)*([^{}\/]+\})}{$1$3}g;
-    s{\\graphicspath\s*\{(?:\{[^{}]*\})+\}}{}g;
-  ' "$tex_file"
+sub resolve_graphics_reference {
+  my ($reference) = @_;
+  return undef unless is_safe_relative_path($reference);
+
+  for my $search_path (@search_paths) {
+    my $candidate = $search_path eq '.' ? $reference : "$search_path/$reference";
+    $candidate =~ s!^\./!!;
+    my $exact = graphics_file($candidate);
+    return $exact if defined $exact;
+    next if $reference =~ /\.[^.]+\z/;
+
+    my $directory = dirname($candidate);
+    my $stem = basename($candidate);
+    next unless opendir my $dir_fh, "$source_dir/$directory";
+    my @matches = grep {
+      /^\Q$stem\E\.(?:pdf|png|jpe?g|eps|ps|svg)\z/i
+        && -f "$source_dir/$directory/$_"
+    } readdir $dir_fh;
+    closedir $dir_fh;
+    die "Error: ambiguous figure reference '$reference' in $source_tex; specify its extension.\n"
+      if @matches > 1;
+    return ($directory eq '.' ? $matches[0] : "$directory/$matches[0]") if @matches;
+  }
+
+  return undef;
+}
+
+my (%reference_target, %target_source, %source_target, @missing, @unsafe);
+while ($tex =~ /\\includegraphics(?:\s*\[[^\]]*\])?\s*\{([^}]*)\}/g) {
+  my $reference = $1;
+  $reference =~ s/^\s+|\s+$//g;
+  next unless length $reference;
+
+  if (!is_safe_relative_path($reference)) {
+    push @unsafe, $reference;
+    next;
+  }
+
+  my $source_file = resolve_graphics_reference($reference);
+  if (!defined $source_file) {
+    push @missing, $reference;
+    next;
+  }
+
+  my $target_file = basename($source_file);
+  if (exists $target_source{$target_file} && $target_source{$target_file} ne $source_file) {
+    die "Error: figure references '$target_source{$target_file}' and '$source_file' have the same filename $target_file; cannot flatten safely.\n";
+  }
+
+  $target_source{$target_file} = $source_file;
+  $source_target{$source_file} = $target_file;
+  $reference_target{$reference} = $target_file;
+}
+
+if (@missing || @unsafe) {
+  print STDERR "Error: figure file(s) referenced by $source_tex could not be used:\n";
+  print STDERR "  - $_\n" for @missing;
+  print STDERR "  - $_ (path outside the source directory)\n" for @unsafe;
+  exit 1;
+}
+
+for my $source_file (sort keys %source_target) {
+  my $target_file = $source_target{$source_file};
+  die "Error: copying $source_file would overwrite $target_file in the submission root.\n"
+    if -e "$submission_dir/$target_file";
+  copy "$source_dir/$source_file", "$submission_dir/$target_file"
+    or die "Error: cannot copy $source_file: $!\n";
+}
+
+open my $submission_fh, '<', $submission_tex
+  or die "Error: cannot read $submission_tex: $!\n";
+my $submission = <$submission_fh>;
+close $submission_fh or die "Error: cannot close $submission_tex: $!\n";
+
+$submission =~ s!
+  (\\includegraphics(?:\s*\[[^\]]*\])?\s*\{)
+  ([^}]*)
+  (\})
+!{
+  my ($start, $reference, $end) = ($1, $2, $3);
+  my $trimmed_reference = $reference;
+  $trimmed_reference =~ s/^\s+|\s+$//g;
+  $start . (exists $reference_target{$trimmed_reference} ? $reference_target{$trimmed_reference} : $reference) . $end;
+}!gex;
+$submission =~ s{\\graphicspath\s*\{(?:\{[^{}]*\})+\}}{}g;
+
+open my $out_fh, '>', $submission_tex or die "Error: cannot write $submission_tex: $!\n";
+print {$out_fh} $submission;
+close $out_fh or die "Error: cannot close $submission_tex: $!\n";
+
+if (%source_target) {
+  print "  $_ -> $source_target{$_}\n" for sort keys %source_target;
+} else {
+  print "  no \\includegraphics references found\n";
+}
+PERL
 }
 
 preprocess_main_tex() {
@@ -533,27 +617,26 @@ else
   echo "2. Skipping bibliography copy ..."
 fi
 
-echo "3. Copying figures/plots directories if present ..."
-copy_asset_dir "$SOURCE_DIR" "$SUBMISSION_DIR"
+echo "3. Copying figures referenced by \\includegraphics ..."
+copy_referenced_figures \
+  "$SOURCE_DIR" \
+  "$SOURCE_DIR/$MAIN_TEX" \
+  "$SUBMISSION_DIR" \
+  "$SUBMISSION_DIR/$MAIN_TEX"
 
-echo "4. Flattening copied figures/plots into submission root ..."
-flatten_asset_dir_to_root "$SUBMISSION_DIR" figures
-flatten_asset_dir_to_root "$SUBMISSION_DIR" plots
-rewrite_flattened_asset_paths "$SUBMISSION_DIR/$MAIN_TEX"
-
-echo "5. Removing comments, stripping \iffalse blocks, and adding arXiv multi-pass trigger ..."
+echo "4. Removing comments, stripping \iffalse blocks, and adding arXiv multi-pass trigger ..."
 preprocess_main_tex "$SUBMISSION_DIR/$MAIN_TEX"
 if ! grep -Fq 'get arXiv to do 4 passes' "$SUBMISSION_DIR/$MAIN_TEX"; then
   printf '\n\\typeout{get arXiv to do 4 passes: Label(s) may have changed. Rerun}\n' >> "$SUBMISSION_DIR/$MAIN_TEX"
 fi
 
-echo "6. Removing unused flattened figure files ..."
+echo "5. Removing unused flattened figure files ..."
 prune_unused_figures "$SUBMISSION_DIR" "$SUBMISSION_DIR/$MAIN_TEX"
 
-echo "7. Renaming copied figures in document order ..."
+echo "6. Renaming copied figures in document order ..."
 rename_figures_in_order "$SUBMISSION_DIR" "$SUBMISSION_DIR/$MAIN_TEX"
 
-echo "8. Compiling submission copy ..."
+echo "7. Compiling submission copy ..."
 (
   cd "$SUBMISSION_DIR"
 
@@ -582,7 +665,7 @@ if [[ "${#BIB_FILES[@]}" -gt 0 ]]; then
   fi
 fi
 
-echo "9. Cleaning generated files, keeping .bbl ..."
+echo "8. Cleaning generated files, keeping .bbl ..."
 find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
   -name '*.aux' -o \
   -name '*.log' -o \
@@ -606,11 +689,11 @@ rm -f "$SUBMISSION_DIR/$jobname.pdf"
 find "$SUBMISSION_DIR" -type f -name '*.bib' -delete
 find "$SUBMISSION_DIR" -depth -type d -empty -delete
 
-echo "10. Final submission contents:"
+echo "9. Final submission contents:"
 find "$SUBMISSION_DIR" -mindepth 1 | sed "s#^$OUTPUT_DIR/##" | sort
 
 echo
-echo "11. Creating tarball: $TAR_PATH"
+echo "10. Creating tarball: $TAR_PATH"
 (
   cd "$SUBMISSION_DIR"
   rm -f "$(basename "$TAR_PATH")"

@@ -59,8 +59,9 @@ The script starts by copying only a limited set of source material into `arxiv_s
 - every `.bib` file explicitly named in the main `.tex` through `\bibliography`,
   `\addbibresource`, `\addglobalbib`, or `\addsectionbib`; names without the
   `.bib` suffix are resolved with it added
-- the `figures/` directory, if present
-- the `plots/` directory, if present
+- every image file referenced by an active `\includegraphics{...}` command;
+  paths are resolved from the source `.tex` directory (and `\graphicspath`, if
+  present)
 
 It does not copy the rest of the source tree.
 
@@ -68,18 +69,17 @@ It does not copy the rest of the source tree.
 
 After copying, the script modifies only the submission copy.
 
-1. It flattens files from `figures/` and `plots/` into the submission root.
-2. It rewrites `\includegraphics{...}` paths in the copied main `.tex` to match the flattened filenames.
-3. It removes LaTeX comments and strips `\iffalse...\fi` blocks from the copied main `.tex`.
-4. It appends the standard arXiv rerun trigger line if it is missing.
-5. It scans the copied main `.tex` for `\includegraphics` usage and deletes flattened figure files that are not referenced.
-6. It renames the remaining copied figures in document order and updates only the copied main `.tex`: `fig1.ext`, `fig2.ext`, and, inside `subfigure` environments or `\subfloat`/`\subfigure` commands, `fig2a.ext`, `fig2b.ext`, and so on. Source figures and the source `.tex` are unchanged.
-7. It compiles the copied submission tree with `latexmk` if available, otherwise with `pdflatex` and `bibtex`.
-8. It keeps the generated `.bbl` file.
-9. It removes copied `.bib` files after compilation.
-10. It removes common LaTeX build artifacts from the submission copy.
-11. It removes the compiled manuscript PDF while keeping figure PDFs.
-12. It creates `ax.tar` inside `arxiv_submission/`.
+1. It copies files named by active `\includegraphics{...}` commands into the submission root and rewrites the copied main `.tex` to use those flattened filenames.
+2. It removes LaTeX comments and strips `\iffalse...\fi` blocks from the copied main `.tex`.
+3. It appends the standard arXiv rerun trigger line if it is missing.
+4. It scans the copied main `.tex` for `\includegraphics` usage and deletes flattened figure files that are not referenced.
+5. It renames the remaining copied figures in document order and updates only the copied main `.tex`: `fig1.ext`, `fig2.ext`, and, inside `subfigure` environments or `\subfloat`/`\subfigure` commands, `fig2a.ext`, `fig2b.ext`, and so on. Source figures and the source `.tex` are unchanged.
+6. It compiles the copied submission tree with `latexmk` if available, otherwise with `pdflatex` and `bibtex`.
+7. It keeps the generated `.bbl` file.
+8. It removes copied `.bib` files after compilation.
+9. It removes common LaTeX build artifacts from the submission copy.
+10. It removes the compiled manuscript PDF while keeping figure PDFs.
+11. It creates `ax.tar` inside `arxiv_submission/`.
 
 ## Important Behavior
 
