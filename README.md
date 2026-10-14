@@ -8,12 +8,14 @@
 
 ```sh
 ./prepare_arxiv_submission.sh
-./prepare_arxiv_submission.sh [SOURCE_DIR]
-./prepare_arxiv_submission.sh [MAIN_TEX]
+./prepare_arxiv_submission.sh [SOURCE_DIR_OR_MAIN_TEX]
 ./prepare_arxiv_submission.sh [SOURCE_DIR] [MAIN_TEX]
 ```
 
-If no source directory is provided, the script uses the current working directory.
+The submission folder is always created in the directory from which you run the
+command, as `./arxiv_submission/`, even when the source files are elsewhere.
+The selected `.tex` file's directory supplies the figures, plots, and
+bibliography files.
 
 If no main `.tex` file is provided, the script looks for these files in order:
 
@@ -21,9 +23,12 @@ If no main `.tex` file is provided, the script looks for these files in order:
 2. `paper.tex`
 3. `main.tex`
 
-If none of those files exists, the script exits with an error.
+If none of those files exists, the script asks for the main file name. You may
+omit the `.tex` extension; the script adds it. A blank response is an error.
 
-If a single `.tex` argument is provided, the script uses that file as the main document and assumes the current directory, unless the argument includes a path.
+If a main-file argument includes a path, its parent directory is used as the
+source directory. With two arguments, the first is the directory relative to
+which the main-file path is resolved. The `.tex` extension is optional.
 
 ## Examples
 
@@ -34,22 +39,26 @@ If a single `.tex` argument is provided, the script uses that file as the main d
 ./prepare_arxiv_submission.sh . main.tex
 ./prepare_arxiv_submission.sh /path/to/paper
 ./prepare_arxiv_submission.sh /path/to/paper paper.tex
+# Run from the desired output directory; source files live in ./paper/ and
+# the submission is created as ./arxiv_submission/.
+./prepare_arxiv_submission.sh ./paper/name.tex
 ```
 
 ## Output
 
-The script creates:
+The script creates in the directory where the command was run:
 
-- `SOURCE_DIR/arxiv_submission/`
-- `SOURCE_DIR/arxiv_submission/ax.tar`
+- `./arxiv_submission/`
+- `./arxiv_submission/ax.tar`
 
 ## What It Copies
 
 The script starts by copying only a limited set of source material into `arxiv_submission/`:
 
 - the selected main `.tex` file
-- one `.bib` file, chosen in this order:
-  same basename as the main `.tex`, then common names such as `bibliography.bib`, `references.bib`, `refs.bib`, `ref.bib`, or `bib.bib`
+- every `.bib` file explicitly named in the main `.tex` through `\bibliography`,
+  `\addbibresource`, `\addglobalbib`, or `\addsectionbib`; names without the
+  `.bib` suffix are resolved with it added
 - the `figures/` directory, if present
 - the `plots/` directory, if present
 
@@ -64,12 +73,13 @@ After copying, the script modifies only the submission copy.
 3. It removes LaTeX comments and strips `\iffalse...\fi` blocks from the copied main `.tex`.
 4. It appends the standard arXiv rerun trigger line if it is missing.
 5. It scans the copied main `.tex` for `\includegraphics` usage and deletes flattened figure files that are not referenced.
-6. It compiles the copied submission tree with `latexmk` if available, otherwise with `pdflatex` and `bibtex`.
-7. It keeps the generated `.bbl` file.
-8. It removes copied `.bib` files after compilation.
-9. It removes common LaTeX build artifacts from the submission copy.
-10. It removes the compiled manuscript PDF while keeping figure PDFs.
-11. It creates `ax.tar` inside `arxiv_submission/`.
+6. It renames the remaining copied figures in document order and updates only the copied main `.tex`: `fig1.ext`, `fig2.ext`, and, inside `subfigure` environments or `\subfloat`/`\subfigure` commands, `fig2a.ext`, `fig2b.ext`, and so on. Source figures and the source `.tex` are unchanged.
+7. It compiles the copied submission tree with `latexmk` if available, otherwise with `pdflatex` and `bibtex`.
+8. It keeps the generated `.bbl` file.
+9. It removes copied `.bib` files after compilation.
+10. It removes common LaTeX build artifacts from the submission copy.
+11. It removes the compiled manuscript PDF while keeping figure PDFs.
+12. It creates `ax.tar` inside `arxiv_submission/`.
 
 ## Important Behavior
 

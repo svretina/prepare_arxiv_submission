@@ -9,6 +9,7 @@ usage() {
 discover_main_tex() {
   local dir="$1"
   local candidate
+  local provided_tex
 
   for candidate in article.tex paper.tex main.tex; do
     if [[ -f "$dir/$candidate" ]]; then
@@ -17,38 +18,88 @@ discover_main_tex() {
     fi
   done
 
-  echo "Error: no main TeX file provided and none of article.tex, paper.tex, or main.tex were found in $dir" >&2
-  return 1
-}
+  read -r -p "No article.tex, paper.tex, or main.tex found. Enter the main TeX filename: " provided_tex || {
+    echo "Error: no main TeX filename provided." >&2
+    return 1
+  }
 
-find_bib_file() {
-  local dir="$1"
-  local main_tex="$2"
-  local main_base="${main_tex%.tex}"
-  local candidate
-  local -a preferred=(
-    "$main_base.bib"
-    bibliography.bib
-    references.bib
-    refs.bib
-    ref.bib
-    bib.bib
-  )
-
-  for candidate in "${preferred[@]}"; do
-    if [[ -f "$dir/$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-
-  mapfile -t bib_files < <(find "$dir" -maxdepth 1 -type f -name '*.bib' -printf '%f\n' | sort)
-  if [[ "${#bib_files[@]}" -eq 1 ]]; then
-    printf '%s\n' "${bib_files[0]}"
-    return 0
+  if [[ -z "$provided_tex" ]]; then
+    echo "Error: main TeX filename cannot be blank." >&2
+    return 1
   fi
 
-  return 1
+  if [[ "$provided_tex" != *.tex ]]; then
+    provided_tex+=".tex"
+  fi
+
+  printf '%s\n' "$provided_tex"
+}
+
+ensure_tex_extension() {
+  local tex_name="$1"
+
+  if [[ "$tex_name" != *.tex ]]; then
+    tex_name+=".tex"
+  fi
+
+  printf '%s\n' "$tex_name"
+}
+
+find_bib_files() {
+  local dir="$1"
+  local main_tex="$2"
+
+  perl - "$dir" "$dir/$main_tex" <<'PERL'
+use strict;
+use warnings;
+
+my ($source_dir, $tex_file) = @ARGV;
+open my $tex_fh, '<', $tex_file or die "Error: cannot read $tex_file: $!\n";
+local $/;
+my $tex = <$tex_fh>;
+close $tex_fh or die "Error: cannot close $tex_file: $!\n";
+
+# Ignore commented-out bibliography declarations, just as LaTeX does.
+$tex =~ s/^[ \t]*%[^\n]*\n//mg;
+$tex =~ s/(?<!\\)%[^\n]*//g;
+
+my (%seen, @bib_files, @missing, @unsafe);
+while ($tex =~ m!\\(bibliography|addbibresource|addglobalbib|addsectionbib)
+                  (?:\s*\[[^\]]*\])?\s*\{([^}]*)\}!gx) {
+  my ($command, $arguments) = ($1, $2);
+
+  # \bibliography accepts a comma-separated list.  Splitting the other
+  # commands too is harmless and supports generated TeX that groups entries.
+  for my $reference (split /,/, $arguments) {
+    $reference =~ s/^\s+|\s+$//g;
+    next unless length $reference;
+    $reference .= '.bib' unless $reference =~ /\.bib\z/i;
+
+    if ($reference =~ m!\A/|(?:\A|/)\.\.(?:/|\z)!) {
+      push @unsafe, $reference;
+      next;
+    }
+
+    if (!-f "$source_dir/$reference") {
+      push @missing, $reference;
+      next;
+    }
+
+    next if $seen{$reference}++;
+    push @bib_files, $reference;
+  }
+}
+
+if (@missing || @unsafe) {
+  print STDERR "Error: bibliography file(s) referenced by $tex_file could not be used:\n";
+  print STDERR "  - $_\n" for @missing;
+  print STDERR "  - $_ (path outside the source directory)\n" for @unsafe;
+  exit 2;
+}
+
+exit 1 unless @bib_files;
+print "$_\n" for @bib_files;
+PERL
 }
 
 copy_asset_dir() {
@@ -137,6 +188,179 @@ preprocess_main_tex() {
   ' "$tex_file"
 }
 
+rename_figures_in_order() {
+  local submission_dir="$1"
+  local tex_file="$2"
+
+  perl - "$submission_dir" "$tex_file" <<'PERL'
+use strict;
+use warnings;
+use File::Basename qw(basename);
+
+my ($submission_dir, $tex_file) = @ARGV;
+open my $tex_fh, '<', $tex_file or die "Error: cannot read $tex_file: $!\n";
+local $/;
+my $tex = <$tex_fh>;
+close $tex_fh or die "Error: cannot close $tex_file: $!\n";
+
+opendir my $dir_fh, $submission_dir
+  or die "Error: cannot read submission directory $submission_dir: $!\n";
+my @files = grep {
+  -f "$submission_dir/$_"
+    && /\.(?:pdf|png|jpe?g|eps|ps|svg)\z/i
+} readdir $dir_fh;
+closedir $dir_fh;
+
+my (%exact_file, %stem_files);
+for my $file (@files) {
+  $exact_file{$file} = $file;
+  (my $stem = $file) =~ s/\.[^.]+\z//;
+  push @{ $stem_files{$stem} }, $file;
+}
+
+sub resolve_reference {
+  my ($reference) = @_;
+  $reference =~ s{^\./}{};
+  $reference = basename($reference);
+
+  return $exact_file{$reference} if exists $exact_file{$reference};
+  return undef if $reference =~ /\.[^.]+\z/;
+
+  my $matches = $stem_files{$reference} // [];
+  die "Error: ambiguous figure reference '$reference' in $tex_file; specify its extension.\n"
+    if @$matches > 1;
+  return $matches->[0];
+}
+
+sub letter_for {
+  my ($number) = @_;
+  my $letters = '';
+  do {
+    $number--;
+    $letters = chr(ord('a') + $number % 26) . $letters;
+    $number = int($number / 26);
+  } while ($number > 0);
+  return $letters;
+}
+
+my (%renamed, %target_owner, %subfigure_count, %direct_count);
+my ($figure_number, $figure_depth, $subfigure_depth, $current_figure, $pending_subfigure) = (0, 0, 0, undef, 0);
+
+while ($tex =~ m!
+  \\begin\s*\{\s*(?:figure\*?|subfigure\*?)\s*\}
+  | \\end\s*\{\s*(?:figure\*?|subfigure\*?)\s*\}
+  | \\sub(?:float|figure)\b
+  | \\includegraphics(?:\s*\[[^\]]*\])?\s*\{[^}]*\}
+!gx) {
+  my $token = $&;
+
+  if ($token =~ /^\\begin\s*\{\s*(figure\*?)\s*\}/) {
+    if ($figure_depth++ == 0) {
+      $current_figure = ++$figure_number;
+    }
+    next;
+  }
+
+  if ($token =~ /^\\end\s*\{\s*(figure\*?)\s*\}/) {
+    if (--$figure_depth <= 0) {
+      $figure_depth = 0;
+      $subfigure_depth = 0;
+      $current_figure = undef;
+      $pending_subfigure = 0;
+    }
+    next;
+  }
+
+  if ($token =~ /^\\begin\s*\{\s*subfigure\*?\s*\}/) {
+    $subfigure_depth++ if $figure_depth;
+    next;
+  }
+
+  if ($token =~ /^\\end\s*\{\s*subfigure\*?\s*\}/) {
+    $subfigure_depth-- if $subfigure_depth;
+    next;
+  }
+
+  if ($token =~ /^\\sub(?:float|figure)\b/) {
+    $pending_subfigure = 1 if $figure_depth;
+    next;
+  }
+
+  my ($reference) = $token =~ /\{([^}]*)\}\z/;
+  my $source_file = resolve_reference($reference);
+  next unless defined $source_file;
+  next if exists $renamed{$source_file};
+
+  my $number = $figure_depth ? $current_figure : ++$figure_number;
+  my $suffix = '';
+  if ($subfigure_depth || $pending_subfigure) {
+    $suffix = letter_for(++$subfigure_count{$number});
+  } elsif (++$direct_count{$number} > 1) {
+    # Multiple graphics in one figure need distinct filenames even when the
+    # source does not wrap them in subfigure environments.
+    $suffix = letter_for(++$subfigure_count{$number});
+  }
+  $pending_subfigure = 0;
+
+  my ($extension) = $source_file =~ /(\.[^.]+)\z/;
+  my $target_file = "fig${number}${suffix}${extension}";
+  die "Error: two figures would be renamed to $target_file.\n"
+    if exists $target_owner{$target_file} && $target_owner{$target_file} ne $source_file;
+
+  $renamed{$source_file} = $target_file;
+  $target_owner{$target_file} = $source_file;
+}
+
+exit 0 unless %renamed;
+
+for my $target_file (keys %target_owner) {
+  my $source_file = $target_owner{$target_file};
+  next if $source_file eq $target_file;
+  next unless -e "$submission_dir/$target_file";
+  die "Error: cannot rename figures because $target_file already exists in the submission root.\n"
+    unless exists $renamed{$target_file};
+}
+
+my %temporary;
+my $index = 0;
+for my $source_file (sort keys %renamed) {
+  my $target_file = $renamed{$source_file};
+  next if $source_file eq $target_file;
+  my $temporary = ".arxiv-figure-rename-$$-" . ++$index;
+  die "Error: temporary filename collision for $temporary.\n"
+    if -e "$submission_dir/$temporary";
+  rename "$submission_dir/$source_file", "$submission_dir/$temporary"
+    or die "Error: cannot rename $source_file temporarily: $!\n";
+  $temporary{$source_file} = $temporary;
+}
+
+for my $source_file (sort keys %renamed) {
+  my $target_file = $renamed{$source_file};
+  next if $source_file eq $target_file;
+  rename "$submission_dir/$temporary{$source_file}", "$submission_dir/$target_file"
+    or die "Error: cannot rename $source_file to $target_file: $!\n";
+}
+
+$tex =~ s!
+  (\\includegraphics(?:\s*\[[^\]]*\])?\s*\{)
+  ([^}]*)
+  (\})
+!{
+  my ($start, $reference, $end) = ($1, $2, $3);
+  my $source_file = resolve_reference($reference);
+  $start . (defined $source_file && exists $renamed{$source_file} ? $renamed{$source_file} : $reference) . $end;
+}!gex;
+
+open my $out_fh, '>', $tex_file or die "Error: cannot write $tex_file: $!\n";
+print {$out_fh} $tex;
+close $out_fh or die "Error: cannot close $tex_file: $!\n";
+
+for my $source_file (sort keys %renamed) {
+  print "  $source_file -> $renamed{$source_file}\n";
+}
+PERL
+}
+
 prune_unused_figures() {
   local submission_dir="$1"
   local tex_file="$2"
@@ -206,12 +430,6 @@ case "$#" in
       SOURCE_DIR="$1"
       MAIN_TEX=""
     else
-      if [[ "$1" != *.tex ]]; then
-        echo "Error: single argument must be an existing directory or a .tex file." >&2
-        usage
-        exit 1
-      fi
-
       if [[ "$1" == */* ]]; then
         SOURCE_DIR="${1%/*}"
         MAIN_TEX="${1##*/}"
@@ -231,6 +449,8 @@ case "$#" in
     ;;
 esac
 
+OUTPUT_DIR="$(pwd)"
+
 if [[ ! -d "$SOURCE_DIR" ]]; then
   echo "Error: source directory does not exist: $SOURCE_DIR" >&2
   exit 1
@@ -240,6 +460,23 @@ SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
 
 if [[ -z "${MAIN_TEX:-}" ]]; then
   MAIN_TEX="$(discover_main_tex "$SOURCE_DIR")"
+else
+  MAIN_TEX="$(ensure_tex_extension "$MAIN_TEX")"
+fi
+
+if [[ "$MAIN_TEX" == */* ]]; then
+  if [[ "$MAIN_TEX" == /* ]]; then
+    SOURCE_DIR="${MAIN_TEX%/*}"
+  else
+    SOURCE_DIR="$SOURCE_DIR/${MAIN_TEX%/*}"
+  fi
+  MAIN_TEX="${MAIN_TEX##*/}"
+
+  if [[ ! -d "$SOURCE_DIR" ]]; then
+    echo "Error: source directory does not exist: $SOURCE_DIR" >&2
+    exit 1
+  fi
+  SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
 fi
 
 if [[ ! -f "$SOURCE_DIR/$MAIN_TEX" ]]; then
@@ -248,14 +485,18 @@ if [[ ! -f "$SOURCE_DIR/$MAIN_TEX" ]]; then
   exit 1
 fi
 
-BIB_FILE=""
-if BIB_FILE="$(find_bib_file "$SOURCE_DIR" "$MAIN_TEX")"; then
-  :
+declare -a BIB_FILES=()
+if bib_output="$(find_bib_files "$SOURCE_DIR" "$MAIN_TEX")"; then
+  mapfile -t BIB_FILES <<< "$bib_output"
 else
-  echo "Warning: no suitable .bib file found next to $MAIN_TEX" >&2
+  bib_status=$?
+  if [[ "$bib_status" -eq 2 ]]; then
+    exit 1
+  fi
+  echo "Warning: no bibliography file is referenced by $MAIN_TEX" >&2
 fi
 
-SUBMISSION_DIR="$SOURCE_DIR/arxiv_submission"
+SUBMISSION_DIR="$OUTPUT_DIR/arxiv_submission"
 TAR_PATH="$SUBMISSION_DIR/ax.tar"
 
 require_command perl
@@ -265,10 +506,14 @@ require_command tar
 echo "Preparing arXiv submission from:"
 echo "  source: $SOURCE_DIR"
 echo "  main:   $MAIN_TEX"
-if [[ -n "$BIB_FILE" ]]; then
-  echo "  bib:    $BIB_FILE"
+echo "  output: $SUBMISSION_DIR"
+if [[ "${#BIB_FILES[@]}" -gt 0 ]]; then
+  echo "  bib:"
+  for bib_file in "${BIB_FILES[@]}"; do
+    echo "    $bib_file"
+  done
 else
-  echo "  bib:    none found"
+  echo "  bib:    none referenced"
 fi
 echo
 
@@ -278,11 +523,14 @@ mkdir -p "$SUBMISSION_DIR"
 echo "1. Copying main TeX file ..."
 cp -a "$SOURCE_DIR/$MAIN_TEX" "$SUBMISSION_DIR/"
 
-if [[ -n "$BIB_FILE" ]]; then
-  echo "2. Copying BibTeX file ..."
-  cp -a "$SOURCE_DIR/$BIB_FILE" "$SUBMISSION_DIR/"
+if [[ "${#BIB_FILES[@]}" -gt 0 ]]; then
+  echo "2. Copying referenced bibliography file(s) ..."
+  for bib_file in "${BIB_FILES[@]}"; do
+    mkdir -p "$SUBMISSION_DIR/$(dirname "$bib_file")"
+    cp -a "$SOURCE_DIR/$bib_file" "$SUBMISSION_DIR/$bib_file"
+  done
 else
-  echo "2. Skipping BibTeX copy ..."
+  echo "2. Skipping bibliography copy ..."
 fi
 
 echo "3. Copying figures/plots directories if present ..."
@@ -302,7 +550,10 @@ fi
 echo "6. Removing unused flattened figure files ..."
 prune_unused_figures "$SUBMISSION_DIR" "$SUBMISSION_DIR/$MAIN_TEX"
 
-echo "7. Compiling submission copy ..."
+echo "7. Renaming copied figures in document order ..."
+rename_figures_in_order "$SUBMISSION_DIR" "$SUBMISSION_DIR/$MAIN_TEX"
+
+echo "8. Compiling submission copy ..."
 (
   cd "$SUBMISSION_DIR"
 
@@ -313,7 +564,7 @@ echo "7. Compiling submission copy ..."
     pdflatex -interaction=nonstopmode -halt-on-error "$MAIN_TEX"
 
     jobname="${MAIN_TEX%.tex}"
-    if [[ -n "$BIB_FILE" && -f "$jobname.aux" ]] && grep -q '\\bibdata{' "$jobname.aux"; then
+    if [[ "${#BIB_FILES[@]}" -gt 0 && -f "$jobname.aux" ]] && grep -q '\\bibdata{' "$jobname.aux"; then
       require_command bibtex
       bibtex "$jobname"
     fi
@@ -325,13 +576,13 @@ echo "7. Compiling submission copy ..."
 )
 
 jobname="${MAIN_TEX%.tex}"
-if [[ -n "$BIB_FILE" ]]; then
+if [[ "${#BIB_FILES[@]}" -gt 0 ]]; then
   if [[ ! -f "$SUBMISSION_DIR/$jobname.bbl" ]]; then
     echo "Warning: no .bbl file was generated." >&2
   fi
 fi
 
-echo "8. Cleaning generated files, keeping .bbl ..."
+echo "9. Cleaning generated files, keeping .bbl ..."
 find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
   -name '*.aux' -o \
   -name '*.log' -o \
@@ -352,13 +603,14 @@ find "$SUBMISSION_DIR" -maxdepth 1 -type f \( \
 
 rm -f "$SUBMISSION_DIR/$jobname.pdf"
 
-find "$SUBMISSION_DIR" -maxdepth 1 -type f -name '*.bib' -delete
+find "$SUBMISSION_DIR" -type f -name '*.bib' -delete
+find "$SUBMISSION_DIR" -depth -type d -empty -delete
 
-echo "9. Final submission contents:"
-find "$SUBMISSION_DIR" -mindepth 1 | sed "s#^$SOURCE_DIR/##" | sort
+echo "10. Final submission contents:"
+find "$SUBMISSION_DIR" -mindepth 1 | sed "s#^$OUTPUT_DIR/##" | sort
 
 echo
-echo "10. Creating tarball: $TAR_PATH"
+echo "11. Creating tarball: $TAR_PATH"
 (
   cd "$SUBMISSION_DIR"
   rm -f "$(basename "$TAR_PATH")"
@@ -367,7 +619,7 @@ echo "10. Creating tarball: $TAR_PATH"
 
 echo
 echo "Done."
-echo "Prepared source directory:"
+echo "Prepared submission directory:"
 echo "  $SUBMISSION_DIR"
 echo "Tarball to upload:"
 echo "  $TAR_PATH"
